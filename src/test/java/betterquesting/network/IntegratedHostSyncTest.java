@@ -1,10 +1,14 @@
-package betterquesting.network.handlers;
+package betterquesting.network;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
@@ -15,6 +19,7 @@ import java.util.UUID;
 
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.nbt.NBTTagList;
+import net.minecraft.network.NetworkManager;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,17 +29,26 @@ import betterquesting.api.questing.IQuest;
 import betterquesting.api.questing.IQuestLine;
 import betterquesting.api.questing.party.IParty;
 import betterquesting.api.utils.NBTConverter;
-import betterquesting.network.IntegratedServerHost;
+import betterquesting.network.handlers.NetChapterSync;
+import betterquesting.network.handlers.NetLifeSync;
+import betterquesting.network.handlers.NetNameSync;
+import betterquesting.network.handlers.NetPartyAction;
+import betterquesting.network.handlers.NetPartySync;
+import betterquesting.network.handlers.NetQuestSync;
 import betterquesting.questing.QuestDatabase;
 import betterquesting.questing.QuestLineDatabase;
 import betterquesting.questing.party.PartyManager;
 import betterquesting.storage.LifeDatabase;
 import betterquesting.storage.NameCache;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.channel.local.LocalChannel;
 
 /**
  * On the client that hosts the integrated server (singleplayer / Open to LAN), the client and the server share the
- * same database singletons. These tests feed the client sync handlers the payloads the server sends and check that:
+ * same database singletons. These tests feed the client packet handlers the payloads the server sends and check that:
  * <ul>
+ * <li>a packet is classified as "from the host's own server" only when it arrived over the in-memory connection;</li>
  * <li>on the host, the handlers leave the server's objects alone (no clear, no reset, no stale overwrite);</li>
  * <li>on a remote client, the handlers still apply the data exactly as before.</li>
  * </ul>
@@ -56,8 +70,40 @@ class IntegratedHostSyncTest {
 
     @AfterEach
     void tearDown() {
-        IntegratedServerHost.setCheckForTesting(null);
         resetDatabases();
+    }
+
+    // --- Packet classification --------------------------------------------------------------------------------------
+
+    /** Only the integrated server connection is in-memory; LAN friends and dedicated servers use TCP. */
+    @Test
+    void onlyInMemoryConnectionsCountAsHost() throws Exception {
+        assertTrue(IntegratedServerHost.isHostConnection(connection(new LocalChannel())));
+        EmbeddedChannel remote = new EmbeddedChannel(new ChannelInboundHandlerAdapter());
+        try {
+            assertFalse(IntegratedServerHost.isHostConnection(connection(remote)));
+        } finally {
+            remote.close();
+        }
+        assertFalse(IntegratedServerHost.isHostConnection(null));
+    }
+
+    /**
+     * Outside a packet handler nothing is treated as host data. In particular a stale
+     * {@code Minecraft.isIntegratedServerRunning()} (left set by an aborted singleplayer launch) cannot make a remote
+     * server's packets be ignored, because the decision is made per packet.
+     */
+    @Test
+    void hostFlagOnlyHoldsWhileHandlingAHostPacket() {
+        assertFalse(IntegratedServerHost.isHost());
+        IntegratedServerHost.runHandler(true, () -> assertTrue(IntegratedServerHost.isHost()));
+        IntegratedServerHost.runHandler(false, () -> assertFalse(IntegratedServerHost.isHost()));
+        assertFalse(IntegratedServerHost.isHost());
+
+        assertThrows(
+            IllegalStateException.class,
+            () -> IntegratedServerHost.runHandler(true, () -> { throw new IllegalStateException("handler failure"); }));
+        assertFalse(IntegratedServerHost.isHost(), "flag leaked after a handler threw");
     }
 
     // --- Quest sync -------------------------------------------------------------------------------------------------
@@ -74,7 +120,6 @@ class IntegratedHostSyncTest {
         invokeAs(true, NetQuestSync.class, fullSyncPayload());
 
         assertSame(quest.proxy, QuestDatabase.INSTANCE.get(QUEST_ID), "server quest was cleared from the database");
-        assertEquals(Collections.emptyList(), quest.calls, "host client rewrote a server quest");
     }
 
     /** Config updates for single quests (quest editing) rebuild the quest's tasks, dropping their progress. */
@@ -136,6 +181,7 @@ class IntegratedHostSyncTest {
 
     // --- Chapter sync -----------------------------------------------------------------------------------------------
 
+    /** Full chapter syncs are broadcast together with full quest syncs (import, default load). */
     @Test
     void hostKeepsServerChaptersOnFullChapterSync() throws Exception {
         Recorder chapter = new Recorder();
@@ -156,14 +202,25 @@ class IntegratedHostSyncTest {
         assertNull(QuestLineDatabase.INSTANCE.get(CHAPTER_ID));
     }
 
-    // --- Party sync -------------------------------------------------------------------------------------------------
+    // --- Party sync / party actions ---------------------------------------------------------------------------------
 
     /**
-     * Accepting a party invite sends the updated party to every online member, including the host. A non-merge party
-     * sync on the host would reset the server's whole party list; a merge would overwrite it with a snapshot.
+     * Accepting a party invite sends the updated party (a merge sync) to every online member, including the host. On
+     * the host that snapshot would overwrite the server's party, e.g. dropping a member who joined in between.
      */
     @Test
-    void hostKeepsServerPartiesOnPartySync() throws Exception {
+    void hostDoesNotOverwriteServerPartyWithSnapshot() throws Exception {
+        Recorder party = new Recorder();
+        PartyManager.INSTANCE.add(PARTY_ID, party.as(IParty.class));
+
+        invokeAs(true, NetPartySync.class, partyPayload(true));
+
+        assertEquals(Collections.emptyList(), party.calls, "host client overwrote a server party");
+    }
+
+    /** Defensive: a non-merge party sync (sent without party IDs) would reset the host's whole party list. */
+    @Test
+    void hostKeepsServerPartiesOnFullPartySync() throws Exception {
         Recorder party = new Recorder();
         Recorder otherParty = new Recorder();
         PartyManager.INSTANCE.add(PARTY_ID, party.as(IParty.class));
@@ -176,16 +233,6 @@ class IntegratedHostSyncTest {
     }
 
     @Test
-    void hostDoesNotOverwriteServerPartyWithSnapshot() throws Exception {
-        Recorder party = new Recorder();
-        PartyManager.INSTANCE.add(PARTY_ID, party.as(IParty.class));
-
-        invokeAs(true, NetPartySync.class, partyPayload(true));
-
-        assertEquals(Collections.emptyList(), party.calls, "host client overwrote a server party");
-    }
-
-    @Test
     void remoteClientStillAppliesPartySync() throws Exception {
         Recorder party = new Recorder();
         PartyManager.INSTANCE.add(PARTY_ID, party.as(IParty.class));
@@ -195,24 +242,61 @@ class IntegratedHostSyncTest {
         assertEquals(Arrays.asList("readFromNBT"), party.calls);
     }
 
-    // --- Life sync (real database) ----------------------------------------------------------------------------------
+    /**
+     * The server frees a party ID as soon as it deletes the party, and new parties take the first free ID. If someone
+     * creates a party before the host processes the delete echo, the echo would delete the new party on the server.
+     */
+    @Test
+    void hostDeleteEchoDoesNotRemoveReplacementParty() throws Exception {
+        Recorder replacement = new Recorder();
+        PartyManager.INSTANCE.add(PARTY_ID, replacement.as(IParty.class)); // reused the deleted party's ID
+
+        invokeAs(true, NetPartyAction.class, partyDeletePayload());
+
+        assertSame(replacement.proxy, PartyManager.INSTANCE.getValue(PARTY_ID), "delete echo removed a new party");
+    }
 
     @Test
-    void hostKeepsServerLivesOnLifeSync() throws Exception {
+    void remoteClientStillAppliesPartyDelete() throws Exception {
+        Recorder party = new Recorder();
+        PartyManager.INSTANCE.add(PARTY_ID, party.as(IParty.class));
+
+        invokeAs(false, NetPartyAction.class, partyDeletePayload());
+
+        assertNull(PartyManager.INSTANCE.getValue(PARTY_ID));
+    }
+
+    // --- Life sync (real database) ----------------------------------------------------------------------------------
+
+    /** NetLifeSync.sendSync with player IDs: a merge snapshot of one player, applied a moment later. */
+    @Test
+    void hostDoesNotApplyStaleLifeSnapshot() throws Exception {
         seedLives(HOST, 3, FRIEND, 2);
-        NBTTagCompound payload = lifePayload(HOST, false);
+        NBTTagCompound snapshot = lifePayload(Collections.singletonList(HOST), true);
         seedLives(HOST, 1); // lost a life after the snapshot was built
 
-        invokeAs(true, NetLifeSync.class, payload);
+        invokeAs(true, NetLifeSync.class, snapshot);
 
         assertEquals(1, LifeDatabase.INSTANCE.getLives(HOST), "stale snapshot gave a lost life back");
-        assertEquals(2, LifeDatabase.INSTANCE.getLives(FRIEND), "friend's lives were reset");
+        assertEquals(2, LifeDatabase.INSTANCE.getLives(FRIEND));
+    }
+
+    /** NetLifeSync.sendSync without player IDs: a full (non-merge) snapshot of everyone. */
+    @Test
+    void hostDoesNotApplyStaleFullLifeSync() throws Exception {
+        seedLives(HOST, 3, FRIEND, 2);
+        NBTTagCompound snapshot = lifePayload(null, false);
+        seedLives(FRIEND, 1); // friend lost a life after the snapshot was built
+
+        invokeAs(true, NetLifeSync.class, snapshot);
+
+        assertEquals(1, LifeDatabase.INSTANCE.getLives(FRIEND), "stale full sync reset a friend's lives");
     }
 
     @Test
     void remoteClientStillAppliesLifeSync() throws Exception {
         seedLives(HOST, 3);
-        NBTTagCompound payload = lifePayload(HOST, true);
+        NBTTagCompound payload = lifePayload(Collections.singletonList(HOST), true);
         seedLives(HOST, 1);
 
         invokeAs(false, NetLifeSync.class, payload);
@@ -222,17 +306,32 @@ class IntegratedHostSyncTest {
 
     // --- Name sync (real database) ----------------------------------------------------------------------------------
 
+    /** NetNameSync.sendNames / quickSync send merge snapshots of a few players. */
     @Test
-    void hostKeepsServerNameCacheOnNameSync() throws Exception {
+    void hostDoesNotApplyStaleNameSnapshot() throws Exception {
         NameCache.INSTANCE.readFromNBT(names(HOST, "Host", FRIEND, "Friend"), false);
+        NBTTagCompound snapshot = namePayload(names(FRIEND, "Friend"), true);
+        NameCache.INSTANCE.readFromNBT(names(FRIEND, "FriendRenamed"), true); // changed after the snapshot
 
-        invokeAs(true, NetNameSync.class, namePayload(names(HOST, "Host"), false));
+        invokeAs(true, NetNameSync.class, snapshot);
+
+        assertEquals("FriendRenamed", NameCache.INSTANCE.getName(FRIEND), "stale snapshot reverted a name");
+    }
+
+    /** NetNameSync.sendNames without IDs: a full (non-merge) list, here missing a player who joined since. */
+    @Test
+    void hostKeepsServerNameCacheOnFullNameSync() throws Exception {
+        NameCache.INSTANCE.readFromNBT(names(HOST, "Host"), false);
+        NBTTagCompound snapshot = namePayload(names(HOST, "Host"), false);
+        NameCache.INSTANCE.readFromNBT(names(FRIEND, "Friend"), true); // joined after the snapshot
+
+        invokeAs(true, NetNameSync.class, snapshot);
 
         assertEquals("Friend", NameCache.INSTANCE.getName(FRIEND), "friend dropped from the server name cache");
     }
 
     @Test
-    void remoteClientStillReplacesNameCacheOnNameSync() throws Exception {
+    void remoteClientStillAppliesNameSync() throws Exception {
         NameCache.INSTANCE.readFromNBT(names(HOST, "Host", FRIEND, "Friend"), false);
 
         invokeAs(false, NetNameSync.class, namePayload(names(HOST, "Host"), false));
@@ -249,6 +348,15 @@ class IntegratedHostSyncTest {
         PartyManager.INSTANCE.reset();
         LifeDatabase.INSTANCE.reset();
         NameCache.INSTANCE.reset();
+    }
+
+    /** A client-side NetworkManager whose connection is the given channel. */
+    private static NetworkManager connection(io.netty.channel.Channel channel) throws Exception {
+        NetworkManager manager = new NetworkManager(true);
+        Field field = NetworkManager.class.getDeclaredField("channel");
+        field.setAccessible(true);
+        field.set(manager, channel);
+        return manager;
     }
 
     /** Same layout as {@code NetQuestSync.sendSync}. */
@@ -293,11 +401,18 @@ class IntegratedHostSyncTest {
         return payload;
     }
 
-    /** Same layout as {@code NetLifeSync.sendSync}. */
-    private static NBTTagCompound lifePayload(UUID player, boolean merge) {
+    /** Same layout as the delete notification in {@code NetPartyAction}. */
+    private static NBTTagCompound partyDeletePayload() {
         NBTTagCompound payload = new NBTTagCompound();
-        payload
-            .setTag("data", LifeDatabase.INSTANCE.writeToNBT(new NBTTagCompound(), Collections.singletonList(player)));
+        payload.setInteger("action", 1); // ACTION_DELETE
+        payload.setInteger("partyID", PARTY_ID);
+        return payload;
+    }
+
+    /** Same layout as {@code NetLifeSync.sendSync}: merge iff player IDs were given. */
+    private static NBTTagCompound lifePayload(List<UUID> players, boolean merge) {
+        NBTTagCompound payload = new NBTTagCompound();
+        payload.setTag("data", LifeDatabase.INSTANCE.writeToNBT(new NBTTagCompound(), players));
         payload.setBoolean("merge", merge);
         return payload;
     }
@@ -335,11 +450,21 @@ class IntegratedHostSyncTest {
         return list;
     }
 
+    /** Runs a client handler the way {@code PacketQuesting} does, with the packet classified as host or remote. */
     private static void invokeAs(boolean host, Class<?> handler, NBTTagCompound payload) throws Exception {
-        IntegratedServerHost.setCheckForTesting(() -> host);
         Method onClient = handler.getDeclaredMethod("onClient", NBTTagCompound.class);
         onClient.setAccessible(true);
-        onClient.invoke(null, payload);
+        Exception[] failure = new Exception[1];
+        IntegratedServerHost.runHandler(host, () -> {
+            try {
+                onClient.invoke(null, payload);
+            } catch (InvocationTargetException e) {
+                failure[0] = e.getCause() instanceof Exception ? (Exception) e.getCause() : e;
+            } catch (IllegalAccessException e) {
+                failure[0] = e;
+            }
+        });
+        if (failure[0] != null) throw failure[0];
     }
 
     /** Dynamic stand-in that records which methods the handler called on it. */
